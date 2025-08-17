@@ -1,0 +1,159 @@
+# recommender_app.py
+
+import streamlit as st
+import pandas as pd
+import backend
+from collections import Counter
+
+st.set_page_config("Course Recommender", layout="wide")
+st.title("📚 Course Recommendation Demo")
+
+# 1. Model selector
+model = st.sidebar.selectbox("Choose Model", list(backend.MODELS))
+embed_type = st.sidebar.radio("Embedding Type", ["BoW", "BERT"])
+
+
+# 2. (Optional) Load common data for EDA
+@st.cache_data
+def load_ratings():
+    return pd.read_csv("data/ratings.csv")
+
+ratings_df, user_emb_df, item_emb_df = backend.load_data()
+
+
+# 3. Hyper-parameter widgets
+params = {}
+if model == "KNN":
+    params["ratings_df"]  = ratings_df
+    params["n_neighbors"] = st.sidebar.slider("k (neighbors)", 1, 50, 10)
+    params["metric"]      = st.sidebar.selectbox("Similarity Metric", ["cosine","pearson","msd"])
+    params["user_based"]  = st.sidebar.checkbox("User-based CF", False)
+
+elif model == "NMF":
+    params["rating_path"] = "data/ratings.csv"
+    params["n_factors"]   = st.sidebar.slider("Latent Factors", 10, 100, 50)
+    params["n_epochs"]    = st.sidebar.slider("Epochs", 5, 50, 15)
+
+elif model == "ClassEmbd":
+    user_emb_file  = "data/user_bert_emb.csv" if embed_type == "BERT" else "data/user_emb.csv"
+    item_emb_file  = "data/course_bert_emb.csv" if embed_type == "BERT" else "data/item_emb.csv"
+    params.update({
+      "rating_path":     "data/ratings.csv",
+      "user_emb_path":   "data/user_emb.csv",
+      "item_emb_path":   "data/item_emb.csv",
+      "model_type":      st.sidebar.selectbox("Classifier", ["logistic","random_forest"]),
+      "test_size":       st.sidebar.slider("Test Size", 0.1, 0.5, 0.2),
+      "random_state":    42
+    })
+
+elif model == "RegEmbd":
+    user_emb_file  = "data/user_bert_emb.csv" if embed_type == "BERT" else "data/user_emb.csv"
+    item_emb_file  = "data/course_bert_emb.csv" if embed_type == "BERT" else "data/item_emb.csv"
+    params.update({
+      "rating_path":     "data/ratings.csv",
+      "user_emb_path":   "data/user_emb.csv",
+      "item_emb_path":   "data/item_emb.csv",
+      "test_size":       st.sidebar.slider("Test Size", 0.1, 0.5, 0.2),
+      "random_state":    42
+    })
+
+elif model == "ANN":
+    user_emb_file  = "data/user_bert_emb.csv" if embed_type == "BERT" else "data/user_emb.csv"
+    item_emb_file  = "data/course_bert_emb.csv" if embed_type == "BERT" else "data/item_emb.csv"
+    params.update({
+      "rating_path":     "data/ratings.csv",
+      "user_emb_path":   "data/user_emb.csv",
+      "item_emb_path":   "data/item_emb.csv",
+      "epochs":          st.sidebar.slider("Epochs", 5, 50, 15),
+      "batch_size":      st.sidebar.number_input("Batch Size", 32, 1024, 256),
+      "lr":              st.sidebar.number_input("Learning Rate", 1e-4, 1e-2, 1e-3, format="%.4f"),
+      "embed_dim":       st.sidebar.slider("Embed Dim", 8, 128, 64),
+      "device":          "cpu"
+    })
+
+# 4. Train button
+with st.sidebar:
+    if st.button("Train"):
+        with st.spinner("Training model..."):
+            # Load the data needed for training
+            ratings_df, user_emb_df, item_emb_df = backend.load_data()
+            # Inject into params for models that need it
+            if model == "KNN" or model == "NMF":
+                params["ratings_df"] = ratings_df
+            backend.train(model, **params)
+        st.sidebar.success("✔ Model trained!")
+
+# 5. Recommendation interface
+user_id = st.selectbox("Select user", sorted(ratings_df["user"].unique()))
+top_k   = st.sidebar.number_input("Top K", min_value=1, max_value=20, value=10)
+
+if st.sidebar.button("Recommend") and user_id:
+    with st.spinner("Generating recommendations…"):
+        if model in {"KNN", "NMF"}:
+            params["rating_path"] = "data/ratings.csv"
+        recs = backend.predict(model, user_id=user_id, top_n=top_k, **params)
+    st.subheader(f"Top {top_k} recommendations for {user_id}")
+    st.table(recs)
+    
+if model in ["ANN", "RegEmbd", "ClassEmbd", "KNN", "NMF"]:
+    with st.expander("📊 Evaluation Metrics"):
+        try:
+            course_vecs_dict = {course_id: vector for course_id, vector in zip(item_emb_df["item"], item_emb_df.iloc[:, 1:].values)}
+            popularity_dict = dict(Counter(ratings_df["item"]))  # count occurrences
+            all_items = ratings_df["item"].unique()
+
+            metrics = backend.evaluate_model(
+                predicted_items=recs["item"].tolist(),
+                ratings_df=ratings_df,
+                user_id=user_id,
+                k=top_k,
+                course_vectors=course_vecs_dict,
+                popularity_dict=popularity_dict,
+                all_items=all_items
+            )
+
+            for name, value in metrics.items():
+                st.write(f"**{name.capitalize()}@{top_k}:** {value:.4f}")
+
+        except Exception as e:
+            st.warning(f"Evaluation error: {e}")
+
+
+# ────────────────────────────────────────────
+# 6. Add Expanders for EDA & Metrics
+# ────────────────────────────────────────────
+
+with st.expander("🔍 Exploratory Data Analysis"):
+    st.write("**Rating value distribution**")
+    dist = ratings_df['rating'].value_counts().sort_index()
+    st.bar_chart(dist)
+
+    st.write("**Top 10 users by # of ratings**")
+    top_users = ratings_df['user'].value_counts().nlargest(10)
+    st.bar_chart(top_users)
+
+    st.write("**Top 10 items by # of ratings**")
+    top_items = ratings_df['item'].value_counts().nlargest(10)
+    st.bar_chart(top_items)
+
+with st.expander("📊 Model Performance Metrics"):
+    # You can implement backend.evaluate() to return a dict of metrics
+    if st.button("Evaluate on hold-out set"):
+        with st.spinner("Evaluating…"):
+            try:
+                metrics = backend.evaluate(model, **params)
+            except AttributeError:
+                st.error("No evaluation function implemented for this model.")
+            else:
+                # Display each metric
+                for name, val in metrics.items():
+                    st.write(f"- **{name}**: {val:.4f}")
+
+evaluate_mode = st.sidebar.checkbox("Run Offline Evaluation")
+if evaluate_mode:
+    st.info("Running offline evaluation (may take time)...")
+    with st.spinner("Evaluating..."):
+        metrics = backend.evaluate_model(model, top_k, ratings_df)
+        st.success("Done!")
+        st.write(metrics)
+    st.stop()
